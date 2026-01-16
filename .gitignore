@@ -1,0 +1,23 @@
+# --- Entorno Virtual y Temporales de Python ---
+venv/
+__pycache__/
+*.pyc
+
+# --- SECRETOS ---
+.env
+tiendapagobi-48e8a045699c.json  
+
+# --- Logs y Basura ---
+logs/
+*.log
+.DS_Store
+
+# --- Carpetas de IDE ---
+.vscode/
+.idea/
+
+# --- DATA ---
+data/
+*.xlsx
+*.csv
+*.json
