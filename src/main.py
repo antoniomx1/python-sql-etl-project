@@ -8,6 +8,12 @@ from load import load_data_to_postgres
 # Carga variables de entorno (para local y para que lea los secretos)
 load_dotenv()
 
+# Crear carpeta de logs si no existe 
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+
+
+
 # Configuración de logs
 logging.basicConfig(
     level=logging.INFO,
