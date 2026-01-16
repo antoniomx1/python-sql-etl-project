@@ -1,73 +1,82 @@
-import os
-import logging
-from sqlalchemy import create_engine
-from dotenv import load_dotenv
-from typing import Dict, Optional
 import pandas as pd
+import logging
+from sqlalchemy import text
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
-def load_data_to_postgres(data_dict: Optional[Dict[str, pd.DataFrame]]):
+def get_existing_ids(table_name, pk_col, engine):
     """
-    Carga los datos a Supabase.
-    Sin saltos, sin rodeos. Si algo falta, avisa, pero aquí alineamos los nombres.
+    Consulta la base de datos para ver qué IDs ya existen.
+    Retorna un set de IDs para búsqueda rápida.
     """
-    if data_dict is None:
-        logger.error("Error: No llegaron datos de la transformación.")
-        return
-
     try:
-        # 1. Conexión
-        user = os.getenv("DB_USER")
-        password = os.getenv("DB_PASS")
-        host = os.getenv("DB_HOST")
-        port = os.getenv("DB_PORT")
-        db_name = os.getenv("DB_NAME")
+        query = f"SELECT {pk_col} FROM {table_name}"
+        existing_df = pd.read_sql(query, engine)
+        return set(existing_df[pk_col].tolist())
+    except Exception:
+        # Si la tabla no existe o está vacía, retornamos set vacío
+        return set()
 
-        connection_url = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
-        engine = create_engine(connection_url)
+def load_to_sql(df, table_name, engine):
+    """
+    Carga INCREMENTAL.
+    1. Revisa qué registros ya existen (usando la PK).
+    2. Filtra los duplicados.
+    3. Solo inserta lo nuevo (Append).
+    """
+    try:
+        # 1. Definir cuál es la Primary Key de cada tabla para validar
+        # Mapeo manual de tus tablas vs sus PKs
+        pk_map = {
+            'dim_sedes': 'id_sede',
+            'dim_tipo_transaccion': 'id_tipo_trx',
+            'dim_distribuidores': 'id_distribuidor',
+            'dim_clientes': 'id_cliente',
+            'fct_transacciones': 'id_trx'
+        }
+
+        if table_name not in pk_map:
+            logger.warning(f"Tabla {table_name} no tiene PK definida en el script. Se intenta append directo.")
+            df.to_sql(table_name, engine, if_exists='append', index=False)
+            return True
+
+        pk_col = pk_map[table_name]
         
-        logger.info("Conectando a Supabase...")
-
-        # 2. Lista de tablas EXACTA como están en tu Base de Datos
-        # OJO: Aquí estaba el error, ya está corregido.
-        tables_to_load = [
-            "dim_sedes", 
-            "dim_tipo_transaccion",  # <--- AHORA SÍ COINCIDE CON TU SQL
-            "dim_distribuidores", 
-            "dim_clientes"
-        ]
+        # 2. Obtener IDs existentes
+        logger.info(f"Validando duplicados en {table_name}...")
+        existing_ids = get_existing_ids(table_name, pk_col, engine)
         
-        # 3. Carga de Dimensiones
-        for table_name in tables_to_load:
-            if table_name in data_dict:
-                logger.info(f"Subiendo tabla: {table_name}...")
-                data_dict[table_name].to_sql(
-                    table_name, 
-                    engine, 
-                    if_exists='append', 
-                    index=False, 
-                    method='multi'
-                )
-                logger.info(f"-> {table_name}: LISTO")
-            else:
-                # Si esto sale, es porque la transformación no mandó la tabla
-                logger.error(f"¡ALERTA! La tabla {table_name} no se encontró en los datos procesados.")
+        # 3. Filtrar: Quedarse solo con lo que NO existe en la base
+        # (El símbolo ~ significa negación: "Donde la columna NO esté en existing_ids")
+        df_new = df[~df[pk_col].isin(existing_ids)]
+        
+        count_new = len(df_new)
+        count_ignored = len(df) - count_new
 
-        # 4. Carga de Hechos (Al final por las llaves foráneas)
-        if "fct_transacciones" in data_dict:
-            logger.info("Subiendo tabla de hechos: fct_transacciones...")
-            data_dict["fct_transacciones"].to_sql(
-                "fct_transacciones", 
-                engine, 
-                if_exists='append', 
-                index=False, 
-                method='multi'
-            )
-            logger.info("-> fct_transacciones: LISTO")
-
-        logger.info("--- CARGA COMPLETA SIN ERRORES ---")
-
+        if count_new > 0:
+            logger.info(f"Insertando {count_new} registros nuevos en {table_name} (Ignorados: {count_ignored}).")
+            df_new.to_sql(table_name, engine, if_exists='append', index=False)
+            return True
+        else:
+            logger.info(f"Tabla {table_name} al día. No hay registros nuevos que insertar.")
+            return True
+            
     except Exception as e:
-        logger.error(f"Error crítico en la BD: {str(e)}")
+        logger.error(f"Error en carga incremental de {table_name}: {str(e)}")
+        # Importante: No retornamos False para no matar el pipeline completo si una tabla falla, 
+        # pero loggeamos el error. O si prefieres estricto, retorna False.
+        return False
+
+def create_db_engine():
+    # Tu funcion de siempre para crear el engine
+    from sqlalchemy import create_engine
+    import os
+    
+    db_user = os.getenv('DB_USER')
+    db_pass = os.getenv('DB_PASS')
+    db_host = os.getenv('DB_HOST')
+    db_port = os.getenv('DB_PORT')
+    db_name = os.getenv('DB_NAME')
+    
+    db_url = f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
+    return create_engine(db_url)

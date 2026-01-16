@@ -1,78 +1,101 @@
 import logging
 import os
+import sys
+from datetime import datetime
 from dotenv import load_dotenv
-from extract import extract_excel_sheet, extract_json_data
-from transform import transform_data
-from load import load_data_to_postgres
 
-# Carga variables de entorno (para local y para que lea los secretos)
-load_dotenv()
+# Importaciones locales
+import extract
+import transform
+import load
 
-# Crear carpetas si no existen 
+# Configuracion global de logging
 if not os.path.exists('logs'):
     os.makedirs('logs')
 
-if not os.path.exists('data'):
-    os.makedirs('data')
-
-
-
-# Configuración de logs
+log_filename = f"logs/pipeline_{datetime.now().strftime('%Y%m%d')}.log"
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("logs/pipeline.log"),
-        logging.StreamHandler()
+        logging.FileHandler(log_filename),
+        logging.StreamHandler(sys.stdout)
     ]
 )
+
 logger = logging.getLogger(__name__)
 
 def run_pipeline():
     """
-    Orquestador principal. 
-    Detecta entorno (Local vs Nube) y gestiona la ingesta desde Drive si es necesario.
+    Orquestador principal del proceso ETL.
     """
-    logger.info("--- INICIANDO PIPELINE DE DATOS (HYBRID CLOUD) ---")
+    try:
+        logger.info("--- INICIO DEL PIPELINE DE DATOS ---")
+        
+        # 1. EXTRACT
+        logger.info("Fase 1: Extraccion de datos")
+        load_dotenv()
+        
+        # Validacion de credenciales criticas
+        if not os.getenv('DB_HOST'):
+            raise ValueError("No se encontraron variables de entorno para la base de datos.")
 
-    # Rutas locales esperadas
-    path_excel = "data/ClientesMarca.xlsx"
-    path_json = "data/RecomendadosMarca.json"
+        # Descarga/Lectura de fuentes
+        # Nota: extract.extract_data debe retornar los 4 dataframes esperados
+        df_clientes, df_transacciones, df_varios, df_recomendados = extract.extract_data()
+        
+        if df_clientes is None:
+            raise ValueError("Fallo critico en la extraccion de archivos.")
 
-    # ID de la carpeta en Google Drive (Vital para GitHub Actions)
-    # Si esto es None, el script solo funcionará si los archivos ya existen localmente.
-    drive_folder_id = os.getenv("DRIVE_FOLDER_ID")
+        # 2. TRANSFORM
+        logger.info("Fase 2: Transformacion y Reglas de Negocio")
+        # Recibimos el diccionario con las tablas listas
+        data_warehouse_tables = transform.transform_data(
+            df_clientes, 
+            df_transacciones, 
+            df_varios, 
+            df_recomendados
+        )
+        
+        if not data_warehouse_tables:
+            raise ValueError("La transformacion retorno datos vacios o nulos.")
 
-    if not drive_folder_id:
-        logger.warning("No se detectó DRIVE_FOLDER_ID. El script dependerá de archivos locales.")
+        # 3. LOAD
+        logger.info("Fase 3: Carga a Base de Datos (Full Refresh)")
+        engine = load.create_db_engine()
+        
+        if not engine:
+            raise ConnectionError("No se pudo establecer conexion a la base de datos.")
 
-    logger.info("Fase 1: Ingesta de datos...")
-    
-    # Pasamos el ID de la carpeta. El extract.py decidirá si descarga o lee local.
-    df_clientes = extract_excel_sheet(path_excel, "Clientes", drive_folder_id)
-    df_transacciones = extract_excel_sheet(path_excel, "Transacciones", drive_folder_id)
-    df_varios = extract_excel_sheet(path_excel, "Varios", drive_folder_id)
-    df_recomendados = extract_json_data(path_json, drive_folder_id)
+        # Orden estricto de carga para respetar integridad referencial (FKs)
+        # 1. Catalogos Independientes (Dimensiones Padreas)
+        ordered_load = [
+            ('dim_sedes', data_warehouse_tables['dim_sedes']),
+            ('dim_tipo_transaccion', data_warehouse_tables['dim_tipo_transaccion']),
+            ('dim_distribuidores', data_warehouse_tables['dim_distribuidores']),
+            # 2. Entidades Dependientes (Dimensiones Hijas)
+            ('dim_clientes', data_warehouse_tables['dim_clientes']),
+            # 3. Hechos (Tabla Central)
+            ('fct_transacciones', data_warehouse_tables['fct_transacciones'])
+        ]
 
-    # Validación de integridad
-    if any(df is None for df in [df_clientes, df_transacciones, df_varios, df_recomendados]):
-        logger.error("Falla crítica: No se pudieron obtener todas las fuentes de datos. Abortando.")
-        return
+        success_count = 0
+        for table_name, df in ordered_load:
+            if not df.empty:
+                result = load.load_to_sql(df, table_name, engine)
+                if result:
+                    success_count += 1
+            else:
+                logger.warning(f"La tabla {table_name} esta vacia. Se omite carga.")
 
-    logger.info("Fase 2: Transformación y Lógica de Negocio...")
-    data_processed = transform_data(
-        df_clientes, 
-        df_transacciones, 
-        df_varios, 
-        df_recomendados
-    )
+        if success_count == len(ordered_load):
+            logger.info(f"--- PIPELINE FINALIZADO CON EXITO ({success_count}/{len(ordered_load)} tablas) ---")
+        else:
+            logger.warning(f"Pipeline finalizado con advertencias. Tablas cargadas: {success_count}/{len(ordered_load)}")
 
-    if data_processed:
-        logger.info("Fase 3: Carga a Data Warehouse (Supabase)...")
-        load_data_to_postgres(data_processed)
-        logger.info("--- PIPELINE FINALIZADO CON ÉXITO ---")
-    else:
-        logger.error("Error en la transformación de datos.")
+    except Exception as e:
+        logger.critical(f"El Pipeline fallo: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     run_pipeline()

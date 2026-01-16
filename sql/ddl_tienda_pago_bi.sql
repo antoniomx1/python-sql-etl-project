@@ -20,9 +20,7 @@ CREATE TABLE dim_tipo_transaccion (
 -- Tabla de Distribuidores (Esta sale del JSON)
 CREATE TABLE dim_distribuidores (
     id_distribuidor INT PRIMARY KEY,
-    nombre_distribuidor VARCHAR(100),
-    telefono BIGINT,
-    categoria VARCHAR(50)
+    nombre_distribuidor VARCHAR(100)
 );
 
 -- Tabla de Clientes
@@ -30,6 +28,9 @@ CREATE TABLE dim_clientes (
     id_cliente INT PRIMARY KEY,
     fecha_afiliacion DATE,
     fecha_primera_trx DATE,
+    telefono BIGINT,           
+    categoria VARCHAR(50),   
+    recomendados INT,          
     id_distribuidor INT REFERENCES dim_distribuidores(id_distribuidor)
 );
 

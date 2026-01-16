@@ -2,6 +2,7 @@ import pandas as pd
 import logging
 from typing import Dict, Optional
 
+# Configuracion de logger a nivel modulo
 logger = logging.getLogger(__name__)
 
 def transform_data(
@@ -11,87 +12,119 @@ def transform_data(
     df_recomendados: pd.DataFrame
 ) -> Optional[Dict[str, pd.DataFrame]]:
     """
-    Transformación con Red de Seguridad para IDs huérfanos.
+    Ejecuta la limpieza y transformacion de datos aplicando reglas de negocio.
     """
     try:
-        logger.info("Iniciando orquestación de transformaciones...")
+        logger.info("Iniciando proceso de transformacion de datos.")
 
-        # --- 1. Segmentación de Catálogos (Archivo Varios) ---
+        # --- 1. Procesamiento de Archivo Mixto (Varios) ---
+        # Buscamos DONDE estan los encabezados 'ID'
+        # Probablemente encuentre indices como [0, 5] (ejemplo)
         split_search = df_varios[df_varios.iloc[:, 0] == 'ID'].index
         
-        if not split_search.empty:
-            cut_point = split_search[0]
-            # Parte 1: SEDES
-            df_sedes = df_varios.iloc[:cut_point].copy()
+        if len(split_search) > 1:
+            # Caso Normal: Encontro dos 'ID' (el del inicio y el de en medio)
+            # El corte real es el SEGUNDO 'ID' (split_search[1])
+            cut_point = split_search[1]
+            
+            # Tabla 1 (Sedes): Desde fila 1 (saltando el primer header) hasta el corte
+            df_sedes = df_varios.iloc[1:cut_point].copy()
             df_sedes.columns = ['id_sede', 'nombre_sede']
             
-            # Parte 2: TIPOS DE TRANSACCION
+            # Tabla 2 (Tipos): Desde corte+1 (saltando el segundo header) hasta el final
             df_tipos = df_varios.iloc[cut_point+1:].copy()
             df_tipos.columns = ['id_tipo_trx', 'descripcion_tipo']
+            
+        elif len(split_search) == 1:
+            # Caso Raro: Solo hay un header. Asumimos que corto al inicio y todo es una sola tabla?
+            # Por seguridad, si pasa esto, mejor partimos asumiendo estructura conocida o fallamos controlado.
+            logger.warning("Solo se encontro un encabezado 'ID'. Intentando logica fallback.")
+            cut_point = split_search[0]
+            if cut_point == 0:
+                 # Si el ID esta en la 0, asumimos que NO hay segunda tabla, solo Sedes?
+                 # Esto es un parche, pero evita el crash.
+                 df_sedes = df_varios.iloc[1:].copy()
+                 df_sedes.columns = ['id_sede', 'nombre_sede']
+                 df_tipos = pd.DataFrame(columns=['id_tipo_trx', 'descripcion_tipo'])
+            else:
+                 df_sedes = df_varios.iloc[:cut_point].copy()
+                 df_tipos = df_varios.iloc[cut_point+1:].copy()
         else:
-            # Fallback por si el archivo viene raro
+            logger.warning("Formato de archivo Varios no estandar (Sin headers 'ID'). Se generan dataframes vacios.")
             df_sedes = pd.DataFrame(columns=['id_sede', 'nombre_sede'])
             df_tipos = pd.DataFrame(columns=['id_tipo_trx', 'descripcion_tipo'])
 
-        # --- RED DE SEGURIDAD (AQUÍ ARREGLAMOS EL ERROR DEL ID 23) ---
-        # 1. Identificamos qué IDs vienen en las transacciones
-        trx_ids = df_transacciones.iloc[:, 2].unique() # Asumimos col 2 es id_tipo_trx por posición en Excel
+        # --- 2. Validacion de Integridad (IDs Huérfanos) ---
+        trx_ids = df_transacciones.iloc[:, 2].unique() 
         
-        # 2. Identificamos qué IDs tenemos en el catálogo
-        # Limpiamos y convertimos a int para poder comparar
+        # Limpieza y casting SEGURO (Manejo de errores si viene basura)
         df_tipos = df_tipos.dropna(subset=['id_tipo_trx'])
+        # Convertimos a string primero para quitar basura y luego a int
+        df_tipos = df_tipos[pd.to_numeric(df_tipos['id_tipo_trx'], errors='coerce').notnull()]
         df_tipos['id_tipo_trx'] = df_tipos['id_tipo_trx'].astype(int)
+        
         catalog_ids = set(df_tipos['id_tipo_trx'])
         
-        # 3. Encontramos los huérfanos (están en trx pero no en catálogo)
         missing_ids = [x for x in trx_ids if x not in catalog_ids and pd.notna(x)]
         
         if missing_ids:
-            logger.warning(f"¡OJO! Se encontraron IDs huérfanos: {missing_ids}. Creando registros dummy.")
-            # Creamos un DataFrame con los faltantes
+            logger.warning(f"Integridad Referencial: IDs huérfanos detectados: {missing_ids}. Generando dummies.")
             df_missing = pd.DataFrame({
                 'id_tipo_trx': missing_ids,
-                'descripcion_tipo': ['Tipo Desconocido (Autogenerado)'] * len(missing_ids)
+                'descripcion_tipo': ['Tipo Desconocido (Sistema)'] * len(missing_ids)
             })
-            # Los pegamos al catálogo oficial
             df_tipos = pd.concat([df_tipos, df_missing], ignore_index=True)
 
-        # --- 2. Normalización de Distribuidores ---
-        df_dist = df_recomendados[
-            ['IDDISTRIBUIDOR', 'NOMBRE DISTRIBUIDOR', 'TELEFONO', 'categoría']
-        ].drop_duplicates(subset=['IDDISTRIBUIDOR'])
-        df_dist.columns = ['id_distribuidor', 'nombre_distribuidor', 'telefono', 'categoria']
+        # --- 3. Normalizacion de Dimension Distribuidores ---
+        df_dist = df_recomendados[['IDDISTRIBUIDOR', 'NOMBRE DISTRIBUIDOR']].drop_duplicates(subset=['IDDISTRIBUIDOR'])
+        df_dist.columns = ['id_distribuidor', 'nombre_distribuidor']
 
-        # --- 3. Enriquecimiento de Clientes ---
-        df_clientes.columns = ['id_cliente', 'fecha_afiliacion', 'fecha_primera_trx']
+        # --- 4. Construccion de Dimension Clientes ---
+        df_clientes_base = df_clientes.rename(columns={
+            'IDCLIENTE': 'id_cliente', 
+            'fechaafiliacion': 'fecha_afiliacion', 
+            'fechaprimertrx': 'fecha_primera_trx'
+        })
+
+        df_json_subset = df_recomendados[['IDCLIENTE', 'IDDISTRIBUIDOR', 'TELEFONO', 'categoría', 'recomendados']]
+        
         df_clientes_final = pd.merge(
-            df_clientes, 
-            df_recomendados[['IDCLIENTE', 'IDDISTRIBUIDOR']], 
+            df_clientes_base, 
+            df_json_subset, 
             left_on='id_cliente', 
             right_on='IDCLIENTE', 
             how='left'
-        ).drop(columns=['IDCLIENTE'])
-        df_clientes_final.columns = ['id_cliente', 'fecha_afiliacion', 'fecha_primera_trx', 'id_distribuidor']
+        )
+        
+        if 'IDCLIENTE' in df_clientes_final.columns:
+            df_clientes_final = df_clientes_final.drop(columns=['IDCLIENTE'])
+            
+        df_clientes_final = df_clientes_final.rename(columns={
+            'IDDISTRIBUIDOR': 'id_distribuidor',
+            'TELEFONO': 'telefono',
+            'categoría': 'categoria'
+        })
 
-        # --- 4. Tabla de Hechos ---
+        # --- 5. Estandarizacion de Tabla de Hechos ---
         df_transacciones.columns = [
             'id_cliente', 'fecha_trx', 'id_tipo_trx', 'id_trx', 'monto', 'fee', 'id_sede'
         ]
 
-        # --- 5. Casting Final ---
+        # --- 6. Casting de Tipos de Datos ---
         for col in ['fecha_afiliacion', 'fecha_primera_trx']:
-            df_clientes_final[col] = pd.to_datetime(df_clientes_final[col]).dt.date
-        df_transacciones['fecha_trx'] = pd.to_datetime(df_transacciones['fecha_trx'])
+            df_clientes_final[col] = pd.to_datetime(df_clientes_final[col], errors='coerce').dt.date
         
+        df_transacciones['fecha_trx'] = pd.to_datetime(df_transacciones['fecha_trx'], errors='coerce')
+        
+        # Casting seguro para Sedes tambien
         df_sedes = df_sedes.dropna(subset=['id_sede'])
+        df_sedes = df_sedes[pd.to_numeric(df_sedes['id_sede'], errors='coerce').notnull()]
         df_sedes['id_sede'] = df_sedes['id_sede'].astype(int)
         
-        # Aseguramos que la tabla de hechos tenga los tipos correctos
         df_transacciones['id_tipo_trx'] = df_transacciones['id_tipo_trx'].astype(int)
 
-        logger.info("Transformación finalizada exitosamente.")
+        logger.info("Transformacion de datos completada.")
         
-        # OJO AQUÍ: Cambiamos el nombre de la llave para que coincida con tu DBeaver
         return {
             "dim_sedes": df_sedes,
             "dim_tipo_transaccion": df_tipos,  
@@ -101,5 +134,6 @@ def transform_data(
         }
 
     except Exception as e:
-        logger.error(f"Falla crítica en transformación: {str(e)}")
-        return None
+        logger.error(f"Error critico durante la transformacion: {str(e)}")
+        # Importante: Levantar la excepcion para que el main se entere y no siga
+        raise e

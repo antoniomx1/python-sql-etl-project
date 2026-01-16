@@ -20,4 +20,4 @@ logs/
 data/
 *.xlsx
 *.csv
-*.json
+*.json  
