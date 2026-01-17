@@ -100,7 +100,7 @@ class SalesBot:
 
         # Construcción del cuerpo del reporte
         reporte = (
-            f"REPORTE COMERCIAL | TIENDA PAGO\n"
+            f"REPORTE COMERCIAL\n"
             f"FECHA DE CORTE: {fecha_formateada}\n"
             f"{'=' * 30}\n\n"
             f"VENTA DEL DÍA: ${metrics['diaria']:,.2f}\n"
